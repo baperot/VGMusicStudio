@@ -122,7 +122,7 @@ namespace Kermalis.VGMusicStudio.Core.Audio
             if (!_isInitialized)
                 throw new InvalidOperationException("Audio device not initialized");
 
-            // Apply volume scaling
+            // Apply volume scaling if needed
             if (_volume < 1.0f)
             {
                 ScaleAudioVolume(audioData, length);
@@ -193,16 +193,22 @@ namespace Kermalis.VGMusicStudio.Core.Audio
         {
             // Convert byte array to float array, scale, and convert back
             int floatCount = length / sizeof(float);
-            unsafe
+            
+            for (int i = 0; i < floatCount; i++)
             {
-                fixed (byte* pAudioData = audioData)
-                {
-                    float* pFloatData = (float*)pAudioData;
-                    for (int i = 0; i < floatCount; i++)
-                    {
-                        pFloatData[i] *= _volume;
-                    }
-                }
+                // Read float from byte array
+                float sample = BitConverter.ToSingle(audioData, i * sizeof(float));
+                
+                // Scale by volume
+                sample *= _volume;
+                
+                // Clamp to valid range
+                if (sample < -1.0f) sample = -1.0f;
+                else if (sample > 1.0f) sample = 1.0f;
+                
+                // Write back to byte array
+                byte[] floatBytes = BitConverter.GetBytes(sample);
+                Array.Copy(floatBytes, 0, audioData, i * sizeof(float), sizeof(float));
             }
         }
 
