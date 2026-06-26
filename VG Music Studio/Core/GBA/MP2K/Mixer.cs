@@ -1,5 +1,5 @@
-﻿using NAudio.Wave;
 using System;
+using System.IO;
 using System.Linq;
 
 namespace Kermalis.VGMusicStudio.Core.GBA.MP2K
@@ -17,7 +17,7 @@ namespace Kermalis.VGMusicStudio.Core.GBA.MP2K
         private float _fadeStepPerMicroframe;
 
         public readonly Config Config;
-        private readonly WaveBuffer _audio;
+        private readonly float[] _audio;
         private readonly float[][] _trackBuffers;
         private readonly PCM8Channel[] _pcm8Channels;
         private readonly SquareChannel _sq1;
@@ -25,7 +25,8 @@ namespace Kermalis.VGMusicStudio.Core.GBA.MP2K
         private readonly PCM4Channel _pcm4;
         private readonly NoiseChannel _noise;
         private readonly PSGChannel[] _psgChannels;
-        private readonly BufferedWaveProvider _buffer;
+        private BinaryWriter _waveWriter;
+        private int _audioDataLength = 0;
 
         public Mixer(Config config)
         {
@@ -43,19 +44,16 @@ namespace Kermalis.VGMusicStudio.Core.GBA.MP2K
             _psgChannels = new PSGChannel[] { _sq1 = new SquareChannel(this), _sq2 = new SquareChannel(this), _pcm4 = new PCM4Channel(this), _noise = new NoiseChannel(this) };
 
             int amt = SamplesPerBuffer * 2;
-            _audio = new WaveBuffer(amt * sizeof(float)) { FloatBufferCount = amt };
+            _audio = new float[amt];
             _trackBuffers = new float[0x10][];
             for (int i = 0; i < _trackBuffers.Length; i++)
             {
                 _trackBuffers[i] = new float[amt];
             }
-            _buffer = new BufferedWaveProvider(WaveFormat.CreateIeeeFloatWaveFormat(SampleRate, 2))
-            {
-                DiscardOnBufferOverflow = true,
-                BufferLength = SamplesPerBuffer * 64
-            };
-            Init(_buffer);
+            
+            Init(SampleRate, 2, SamplesPerBuffer);
         }
+
         public override void Dispose()
         {
             base.Dispose();
@@ -110,6 +108,7 @@ namespace Kermalis.VGMusicStudio.Core.GBA.MP2K
             }
             return nChn;
         }
+
         public PSGChannel AllocPSGChannel(Track owner, ADSR env, Note note, byte vol, sbyte pan, int instPan, int pitch, VoiceType type, object arg)
         {
             PSGChannel nChn;
@@ -169,6 +168,7 @@ namespace Kermalis.VGMusicStudio.Core.GBA.MP2K
             _fadeStepPerMicroframe = 1f / _fadeMicroFramesLeft;
             _isFading = true;
         }
+
         public void BeginFadeOut()
         {
             _fadePos = 1f;
@@ -176,29 +176,68 @@ namespace Kermalis.VGMusicStudio.Core.GBA.MP2K
             _fadeStepPerMicroframe = -1f / _fadeMicroFramesLeft;
             _isFading = true;
         }
+
         public bool IsFading()
         {
             return _isFading;
         }
+
         public bool IsFadeDone()
         {
             return _isFading && _fadeMicroFramesLeft == 0;
         }
+
         public void ResetFade()
         {
             _isFading = false;
             _fadeMicroFramesLeft = 0;
         }
 
-        private WaveFileWriter _waveWriter;
         public void CreateWaveWriter(string fileName)
         {
-            _waveWriter = new WaveFileWriter(fileName, _buffer.WaveFormat);
+            FileStream fileStream = File.Create(fileName);
+            _waveWriter = new BinaryWriter(fileStream);
+            _audioDataLength = 0;
+
+            // Write WAV header
+            _waveWriter.Write(new char[] { 'R', 'I', 'F', 'F' });
+            _waveWriter.Write(0); // File size - 8 (placeholder)
+            _waveWriter.Write(new char[] { 'W', 'A', 'V', 'E' });
+
+            // Write fmt chunk
+            _waveWriter.Write(new char[] { 'f', 'm', 't', ' ' });
+            _waveWriter.Write(16); // Chunk size
+            _waveWriter.Write((ushort)1); // Audio format (PCM)
+            _waveWriter.Write((ushort)2); // Channels (stereo)
+            _waveWriter.Write(SampleRate); // Sample rate
+            _waveWriter.Write(SampleRate * 2 * 2); // Byte rate
+            _waveWriter.Write((ushort)4); // Block align
+            _waveWriter.Write((ushort)16); // Bits per sample
+
+            // Write data chunk
+            _waveWriter.Write(new char[] { 'd', 'a', 't', 'a' });
+            _waveWriter.Write(0); // Data size (placeholder)
         }
+
         public void CloseWaveWriter()
         {
-            _waveWriter?.Dispose();
+            if (_waveWriter != null)
+            {
+                long pos = _waveWriter.BaseStream.Position;
+
+                // Update data chunk size
+                _waveWriter.BaseStream.Seek(40, SeekOrigin.Begin);
+                _waveWriter.Write(_audioDataLength);
+
+                // Update file size
+                _waveWriter.BaseStream.Seek(4, SeekOrigin.Begin);
+                _waveWriter.Write((int)(pos - 8));
+
+                _waveWriter.Close();
+                _waveWriter = null;
+            }
         }
+
         public void Process(bool output, bool recording)
         {
             for (int i = 0; i < _trackBuffers.Length; i++)
@@ -206,7 +245,7 @@ namespace Kermalis.VGMusicStudio.Core.GBA.MP2K
                 float[] buf = _trackBuffers[i];
                 Array.Clear(buf, 0, buf.Length);
             }
-            _audio.Clear();
+            Array.Clear(_audio, 0, _audio.Length);
 
             for (int i = 0; i < _pcm8Channels.Length; i++)
             {
@@ -248,6 +287,7 @@ namespace Kermalis.VGMusicStudio.Core.GBA.MP2K
                 masterStep = (toMaster - fromMaster) * _samplesReciprocal;
                 masterLevel = fromMaster;
             }
+            
             for (int i = 0; i < _trackBuffers.Length; i++)
             {
                 if (!Mutes[i])
@@ -256,20 +296,40 @@ namespace Kermalis.VGMusicStudio.Core.GBA.MP2K
                     float[] buf = _trackBuffers[i];
                     for (int j = 0; j < SamplesPerBuffer; j++)
                     {
-                        _audio.FloatBuffer[j * 2] += buf[j * 2] * level;
-                        _audio.FloatBuffer[(j * 2) + 1] += buf[(j * 2) + 1] * level;
+                        _audio[j * 2] += buf[j * 2] * level;
+                        _audio[(j * 2) + 1] += buf[(j * 2) + 1] * level;
                         level += masterStep;
                     }
                 }
             }
+            
             if (output)
             {
-                _buffer.AddSamples(_audio.ByteBuffer, 0, _audio.ByteBufferCount);
+                byte[] audioBytes = ConvertFloatToBytes(_audio);
+                QueueAudio(audioBytes, audioBytes.Length);
             }
-            if (recording)
+            if (recording && _waveWriter != null)
             {
-                _waveWriter.Write(_audio.ByteBuffer, 0, _audio.ByteBufferCount);
+                byte[] audioBytes = ConvertFloatToBytes(_audio);
+                _waveWriter.Write(audioBytes);
+                _audioDataLength += audioBytes.Length;
             }
+        }
+
+        private byte[] ConvertFloatToBytes(float[] floatData)
+        {
+            byte[] byteData = new byte[floatData.Length * 2];
+            for (int i = 0; i < floatData.Length; i++)
+            {
+                // Clamp and convert to 16-bit PCM
+                float sample = Math.Max(-1.0f, Math.Min(1.0f, floatData[i]));
+                short sampleInt = (short)(sample * 32767);
+                
+                // Little-endian
+                byteData[i * 2] = (byte)(sampleInt & 0xFF);
+                byteData[i * 2 + 1] = (byte)((sampleInt >> 8) & 0xFF);
+            }
+            return byteData;
         }
     }
 }
