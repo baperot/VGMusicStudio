@@ -1,5 +1,5 @@
-﻿using NAudio.Wave;
 using System;
+using System.IO;
 
 namespace Kermalis.VGMusicStudio.Core.NDS.DSE
 {
@@ -14,14 +14,16 @@ namespace Kermalis.VGMusicStudio.Core.NDS.DSE
         private float _fadeStepPerMicroframe;
 
         private readonly Channel[] _channels;
-        private readonly BufferedWaveProvider _buffer;
+        private const int sampleRate = 65456;
+        private const int channels = 2;
+        private BinaryWriter _waveWriter;
+        private int _audioDataLength = 0;
 
         public Mixer()
         {
             // The sampling frequency of the mixer is 1.04876 MHz with an amplitude resolution of 24 bits, but the sampling frequency after mixing with PWM modulation is 32.768 kHz with an amplitude resolution of 10 bits.
             // - gbatek
             // I'm not using either of those because the samples per buffer leads to an overflow eventually
-            const int sampleRate = 65456;
             _samplesPerBuffer = 341; // TODO
             _samplesReciprocal = 1f / _samplesPerBuffer;
 
@@ -31,13 +33,9 @@ namespace Kermalis.VGMusicStudio.Core.NDS.DSE
                 _channels[i] = new Channel(i);
             }
 
-            _buffer = new BufferedWaveProvider(new WaveFormat(sampleRate, 16, 2))
-            {
-                DiscardOnBufferOverflow = true,
-                BufferLength = _samplesPerBuffer * 64
-            };
-            Init(_buffer);
+            Init(sampleRate, channels, _samplesPerBuffer);
         }
+
         public override void Dispose()
         {
             base.Dispose();
@@ -108,6 +106,7 @@ namespace Kermalis.VGMusicStudio.Core.NDS.DSE
             _fadeStepPerMicroframe = 1f / _fadeMicroFramesLeft;
             _isFading = true;
         }
+
         public void BeginFadeOut()
         {
             _fadePos = 1f;
@@ -115,29 +114,68 @@ namespace Kermalis.VGMusicStudio.Core.NDS.DSE
             _fadeStepPerMicroframe = -1f / _fadeMicroFramesLeft;
             _isFading = true;
         }
+
         public bool IsFading()
         {
             return _isFading;
         }
+
         public bool IsFadeDone()
         {
             return _isFading && _fadeMicroFramesLeft == 0;
         }
+
         public void ResetFade()
         {
             _isFading = false;
             _fadeMicroFramesLeft = 0;
         }
 
-        private WaveFileWriter _waveWriter;
         public void CreateWaveWriter(string fileName)
         {
-            _waveWriter = new WaveFileWriter(fileName, _buffer.WaveFormat);
+            FileStream fileStream = File.Create(fileName);
+            _waveWriter = new BinaryWriter(fileStream);
+            _audioDataLength = 0;
+
+            // Write WAV header
+            _waveWriter.Write(new char[] { 'R', 'I', 'F', 'F' });
+            _waveWriter.Write(0); // File size - 8 (placeholder)
+            _waveWriter.Write(new char[] { 'W', 'A', 'V', 'E' });
+
+            // Write fmt chunk
+            _waveWriter.Write(new char[] { 'f', 'm', 't', ' ' });
+            _waveWriter.Write(16); // Chunk size
+            _waveWriter.Write((ushort)1); // Audio format (PCM)
+            _waveWriter.Write((ushort)channels); // Channels
+            _waveWriter.Write(sampleRate); // Sample rate
+            _waveWriter.Write(sampleRate * channels * 2); // Byte rate
+            _waveWriter.Write((ushort)(channels * 2)); // Block align
+            _waveWriter.Write((ushort)16); // Bits per sample
+
+            // Write data chunk
+            _waveWriter.Write(new char[] { 'd', 'a', 't', 'a' });
+            _waveWriter.Write(0); // Data size (placeholder)
         }
+
         public void CloseWaveWriter()
         {
-            _waveWriter?.Dispose();
+            if (_waveWriter != null)
+            {
+                long pos = _waveWriter.BaseStream.Position;
+
+                // Update data chunk size
+                _waveWriter.BaseStream.Seek(40, SeekOrigin.Begin);
+                _waveWriter.Write(_audioDataLength);
+
+                // Update file size
+                _waveWriter.BaseStream.Seek(4, SeekOrigin.Begin);
+                _waveWriter.Write((int)(pos - 8));
+
+                _waveWriter.Close();
+                _waveWriter = null;
+            }
         }
+
         public void Process(bool output, bool recording)
         {
             float masterStep;
@@ -165,14 +203,13 @@ namespace Kermalis.VGMusicStudio.Core.NDS.DSE
             byte[] b = new byte[4];
             for (int i = 0; i < _samplesPerBuffer; i++)
             {
-                int left = 0,
-                    right = 0;
+                int left = 0, right = 0;
                 for (int j = 0; j < _numChannels; j++)
                 {
                     Channel chan = _channels[j];
                     if (chan.Owner != null)
                     {
-                        bool muted = Mutes[chan.Owner.Index]; // Get mute first because chan.Process() can call chan.Stop() which sets chan.Owner to null
+                        bool muted = Mutes[chan.Owner.Index];
                         chan.Process(out short channelLeft, out short channelRight);
                         if (!muted)
                         {
@@ -182,37 +219,28 @@ namespace Kermalis.VGMusicStudio.Core.NDS.DSE
                     }
                 }
                 float f = left * masterLevel;
-                if (f < short.MinValue)
-                {
-                    f = short.MinValue;
-                }
-                else if (f > short.MaxValue)
-                {
-                    f = short.MaxValue;
-                }
+                if (f < short.MinValue) f = short.MinValue;
+                else if (f > short.MaxValue) f = short.MaxValue;
                 left = (int)f;
                 b[0] = (byte)left;
                 b[1] = (byte)(left >> 8);
+                
                 f = right * masterLevel;
-                if (f < short.MinValue)
-                {
-                    f = short.MinValue;
-                }
-                else if (f > short.MaxValue)
-                {
-                    f = short.MaxValue;
-                }
+                if (f < short.MinValue) f = short.MinValue;
+                else if (f > short.MaxValue) f = short.MaxValue;
                 right = (int)f;
                 b[2] = (byte)right;
                 b[3] = (byte)(right >> 8);
                 masterLevel += masterStep;
+                
                 if (output)
                 {
-                    _buffer.AddSamples(b, 0, 4);
+                    QueueAudio(b, 4);
                 }
                 if (recording)
                 {
                     _waveWriter.Write(b, 0, 4);
+                    _audioDataLength += 4;
                 }
             }
         }
