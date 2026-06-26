@@ -1,41 +1,40 @@
-﻿using Kermalis.VGMusicStudio.UI;
-using NAudio.CoreAudioApi;
-using NAudio.CoreAudioApi.Interfaces;
-using NAudio.Wave;
+using Kermalis.VGMusicStudio.UI;
+using Kermalis.VGMusicStudio.Core.Audio;
 using System;
 
 namespace Kermalis.VGMusicStudio.Core
 {
-    internal abstract class Mixer : IAudioSessionEventsHandler, IDisposable
+    internal abstract class Mixer : IDisposable
     {
         public readonly bool[] Mutes = new bool[SongInfoControl.SongInfo.MaxTracks];
-        private IWavePlayer _out;
-        private AudioSessionControl _appVolume;
+        protected SDL2AudioWrapper AudioDevice;
+        private bool _volChange = true;
 
-        protected void Init(IWaveProvider waveProvider)
+        protected void Init(int sampleRate, int channels, int bufferSize)
         {
-            _out = new WasapiOut();
-            _out.Init(waveProvider);
-            using (var en = new MMDeviceEnumerator())
-            {
-                SessionCollection sessions = en.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia).AudioSessionManager.Sessions;
-                int id = System.Diagnostics.Process.GetCurrentProcess().Id;
-                for (int i = 0; i < sessions.Count; i++)
-                {
-                    AudioSessionControl session = sessions[i];
-                    if (session.GetProcessID == id)
-                    {
-                        _appVolume = session;
-                        _appVolume.RegisterEventClient(this);
-                        break;
-                    }
-                }
-            }
-            _out.Play();
+            AudioDevice = new SDL2AudioWrapper();
+            AudioDevice.Init(sampleRate, channels, bufferSize);
+            AudioDevice.Play();
         }
 
-        private bool _volChange = true;
-        public void OnVolumeChanged(float volume, bool isMuted)
+        public void SetVolume(float volume)
+        {
+            _volChange = false;
+            if (AudioDevice != null)
+            {
+                AudioDevice.Volume = volume;
+            }
+        }
+
+        public void QueueAudio(byte[] audioData, int length)
+        {
+            if (AudioDevice != null)
+            {
+                AudioDevice.QueueAudio(audioData, length);
+            }
+        }
+
+        public void OnVolumeChanged(float volume)
         {
             if (_volChange)
             {
@@ -43,45 +42,11 @@ namespace Kermalis.VGMusicStudio.Core
             }
             _volChange = true;
         }
-        public void OnDisplayNameChanged(string displayName)
-        {
-            throw new NotImplementedException();
-        }
-        public void OnIconPathChanged(string iconPath)
-        {
-            throw new NotImplementedException();
-        }
-        public void OnChannelVolumeChanged(uint channelCount, IntPtr newVolumes, uint channelIndex)
-        {
-            throw new NotImplementedException();
-        }
-        public void OnGroupingParamChanged(ref Guid groupingId)
-        {
-            throw new NotImplementedException();
-        }
-        // Fires on @out.Play() and @out.Stop()
-        public void OnStateChanged(AudioSessionState state)
-        {
-            if (state == AudioSessionState.AudioSessionStateActive)
-            {
-                OnVolumeChanged(_appVolume.SimpleAudioVolume.Volume, _appVolume.SimpleAudioVolume.Mute);
-            }
-        }
-        public void OnSessionDisconnected(AudioSessionDisconnectReason disconnectReason)
-        {
-            throw new NotImplementedException();
-        }
-        public void SetVolume(float volume)
-        {
-            _volChange = false;
-            _appVolume.SimpleAudioVolume.Volume = volume;
-        }
 
         public virtual void Dispose()
         {
-            _out.Stop();
-            _out.Dispose();
-            _appVolume.Dispose();
+            AudioDevice?.Stop();
+            AudioDevice?.Dispose();
         }
     }
 }
